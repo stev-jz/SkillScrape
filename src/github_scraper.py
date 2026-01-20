@@ -125,8 +125,7 @@ if __name__ == "__main__":
     print("GitHub Job URL Extractor - Test Run")
     print("=" * 60)
     
-    # Fetch and extract (limit to 10 
-    for testing)
+    # Fetch and extract (limit to 10 for testing)
     jobs = get_job_urls(limit=10)
     
     print("\nSample Job Postings:")
