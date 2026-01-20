@@ -21,24 +21,26 @@ def parse_job_text(raw_text):
 
 
     prompt = f"""
-    You are an expert Tech Recruiter. Your goal is to be EXHAUSTIVE. 
-    If a tool or skill is mentioned in the text, it MUST be extracted.
+    You are an expert Tech Recruiter extracting SPECIFIC technical skills.
 
-    Strategy:
-    1. Look specifically for sections labeled "Requirements", "Qualifications", or "Stack".
-    2. "Tools" includes: DevOps (Docker), Source Control (Git, GitHub), Project Management (Jira, Confluence), and Cloud (AWS).
-    3. Do not ignore "Soft Technical" skills like Agile, Scrum, or SDLC.
+    RULES:
+    1. Only extract CONCRETE, SPECIFIC skills - not vague descriptions.
+    2. Split combined skills: "C/C++" should become ["C", "C++"], "React/Vue" becomes ["React", "Vue"].
+    3. Use STANDARD names: "Python" not "python programming", "AWS" not "Amazon Web Services".
+    4. For concepts: ONLY include well-known methodologies (Agile, Scrum, CI/CD, OOP, REST, GraphQL).
+       DO NOT include vague terms like "problem solving", "communication", "teamwork", "fast-paced".
+    5. Limit concepts to MAX 5 most important ones.
 
     Return ONLY a JSON object with this exact schema:
     {{
       "job_title": "Extract the likely job title",
       "company": "Extract company name if present, else null",
       "skills": {{
-        "languages": ["Programming languages e.g. Python, Java, TypeScript"],
-        "frameworks": ["Frameworks/Libraries e.g. React, Spring Boot, .NET"],
-        "databases": ["Databases e.g. PostgreSQL, MongoDB, Redis"],
-        "tools": ["ALL tools: Git, Jira, Docker, AWS, Kubernetes, Jenkins, Excel"],
-        "concepts": ["Methodologies e.g. Agile, OOP, CI/CD, Distributed Systems"]
+        "languages": ["Programming languages: Python, Java, C++, JavaScript, etc."],
+        "frameworks": ["Frameworks/Libraries: React, Spring Boot, Django, .NET, etc."],
+        "databases": ["Databases: PostgreSQL, MongoDB, Redis, MySQL, etc."],
+        "tools": ["Tools: Git, Docker, AWS, Kubernetes, Jenkins, Jira, etc."],
+        "concepts": ["ONLY well-known methodologies: Agile, CI/CD, OOP, REST, etc. MAX 5"]
       }}
     }}
 
@@ -65,6 +67,100 @@ def parse_job_text(raw_text):
     except Exception as e:
         print(f"Error parsing with Gemini: {e}")
         return None
+
+
+# Maximum safe batch size (accounts for 1M token limit with ~8K chars per job)
+MAX_BATCH_SIZE = 30
+
+def parse_job_texts_batch(job_texts: list[tuple[str, str]]) -> list[dict]:
+    """
+    Parse multiple job descriptions in a SINGLE API call.
+    This maximizes your requests-per-day limit.
+    
+    Args:
+        job_texts: List of tuples (job_id, raw_text) where job_id is used to match results
+        
+    Returns:
+        List of parsed job dicts with 'job_id' field to match back to original
+    """
+    if not job_texts:
+        return []
+    
+    # Safety check: limit batch size to avoid token limits
+    if len(job_texts) > MAX_BATCH_SIZE:
+        print(f"⚠️  Warning: Batch size {len(job_texts)} exceeds safe limit of {MAX_BATCH_SIZE}. Truncating.")
+        job_texts = job_texts[:MAX_BATCH_SIZE]
+    
+    # Build the batch prompt
+    jobs_section = ""
+    for i, (job_id, raw_text) in enumerate(job_texts):
+        # Truncate very long descriptions to avoid token limits
+        truncated = raw_text[:8000] if len(raw_text) > 8000 else raw_text
+        jobs_section += f"""
+---JOB {i+1} (ID: {job_id})---
+{truncated}
+"""
+
+    prompt = f"""
+You are an expert Tech Recruiter extracting SPECIFIC technical skills from multiple job postings.
+
+RULES:
+1. Only extract CONCRETE, SPECIFIC skills - not vague descriptions.
+2. Split combined skills: "C/C++" should become ["C", "C++"], "React/Vue" becomes ["React", "Vue"].
+3. Use STANDARD names: "Python" not "python programming", "AWS" not "Amazon Web Services".
+4. For concepts: ONLY include well-known methodologies (Agile, Scrum, CI/CD, OOP, REST, GraphQL).
+   DO NOT include vague terms like "problem solving", "communication", "teamwork", "fast-paced".
+5. Limit concepts to MAX 5 most important ones per job.
+
+Return ONLY a JSON array with one object per job, in the same order as input:
+[
+  {{
+    "job_id": "the ID from the input",
+    "job_title": "Extract the likely job title",
+    "company": "Extract company name if present, else null",
+    "skills": {{
+      "languages": ["Programming languages"],
+      "frameworks": ["Frameworks/Libraries"],
+      "databases": ["Databases"],
+      "tools": ["Tools"],
+      "concepts": ["Methodologies, MAX 5"]
+    }}
+  }},
+  ...
+]
+
+HERE ARE {len(job_texts)} JOB DESCRIPTIONS TO PARSE:
+{jobs_section}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.0-flash', 
+            contents=prompt
+        )
+        
+        cleaned_text = response.text.strip()
+        
+        # Handle markdown backticks
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        elif cleaned_text.startswith("```"):
+            cleaned_text = cleaned_text[3:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+        
+        results = json.loads(cleaned_text.strip())
+        
+        # Ensure it's a list
+        if isinstance(results, dict):
+            results = [results]
+            
+        return results
+        
+    except Exception as e:
+        print(f"Error batch parsing with Gemini: {e}")
+        return []
+
 
 # TEST BLOCK
 if __name__ == "__main__":
