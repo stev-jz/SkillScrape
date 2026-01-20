@@ -8,6 +8,79 @@ load_dotenv()
 
 DB_URL = os.getenv("DB_CONNECTION_STRING")
 
+# Skill normalization mappings
+SKILL_ALIASES = {
+    'javascript': 'JavaScript',
+    'typescript': 'TypeScript',
+    'python': 'Python',
+    'java': 'Java',
+    'c#': 'C#',
+    'c++': 'C++',
+    'golang': 'Go',
+    'nodejs': 'Node.js',
+    'node.js': 'Node.js',
+    'react.js': 'React',
+    'reactjs': 'React',
+    'vue.js': 'Vue',
+    'vuejs': 'Vue',
+    'angular.js': 'Angular',
+    'angularjs': 'Angular',
+    'postgresql': 'PostgreSQL',
+    'postgres': 'PostgreSQL',
+    'mongodb': 'MongoDB',
+    'mysql': 'MySQL',
+    'amazon web services': 'AWS',
+    'google cloud platform': 'GCP',
+    'google cloud': 'GCP',
+    'microsoft azure': 'Azure',
+    'ci/cd': 'CI/CD',
+    'continuous integration': 'CI/CD',
+}
+
+def normalize_skill(skill_name: str) -> list:
+    """
+    Normalizes a skill name and splits combined skills.
+    Returns a list of normalized skill names.
+    """
+    skill = skill_name.strip()
+    
+    # Skip empty or very short skills
+    if len(skill) < 2:
+        return []
+    
+    # Check for known aliases FIRST (before splitting)
+    # This preserves skills like "CI/CD" as a single unit
+    if skill.lower() in SKILL_ALIASES:
+        return [SKILL_ALIASES[skill.lower()]]
+    
+    # Skip vague/non-technical skills
+    skip_terms = ['problem solving', 'communication', 'teamwork', 'fast-paced', 
+                  'self-starter', 'detail-oriented', 'passionate', 'motivated',
+                  'excellent', 'strong', 'good', 'ability to', 'experience with']
+    if any(term in skill.lower() for term in skip_terms):
+        return []
+    
+    # Keep compound technical terms as single skills
+    keep_as_single = ['data structures', 'algorithms', 'data structures & algorithms',
+                      'data structures and algorithms', 'object oriented', 
+                      'machine learning', 'deep learning', 'computer vision',
+                      'natural language processing', 'distributed systems']
+    if any(term in skill.lower() for term in keep_as_single):
+        return [skill]
+    
+    # Split combined skills like "C/C++", "React/Vue", "Python/Java"
+    if '/' in skill and len(skill) < 20:  # Only split short combined skills
+        parts = [p.strip() for p in skill.split('/')]
+        result = []
+        for part in parts:
+            if len(part) >= 2:
+                normalized = SKILL_ALIASES.get(part.lower(), part)
+                result.append(normalized)
+        return result if result else [skill]
+    
+    # Return as-is if no special handling needed
+    return [skill]
+
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     try:
@@ -49,6 +122,18 @@ def init_db():
                     job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
                     skill_id INTEGER REFERENCES skills(id) ON DELETE CASCADE,
                     PRIMARY KEY (job_id, skill_id)
+                );
+                """)
+                
+                # 4. FAILED_URLS (Track URLs that failed to scrape)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS failed_urls (
+                    id SERIAL PRIMARY KEY,
+                    url TEXT UNIQUE,
+                    error TEXT,
+                    attempts INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """)
                 
@@ -95,29 +180,31 @@ def save_job_data(job_data):
                 
                 for category, skill_list in all_skills.items():
                     for skill_name in skill_list:
-                        clean_name = skill_name.strip()
+                        # Normalize and split combined skills
+                        normalized_skills = normalize_skill(skill_name)
                         
-                        # Insert Skill if new
-                        cur.execute("""
-                        INSERT INTO skills (name, category) 
-                        VALUES (%s, %s)
-                        ON CONFLICT (name) DO NOTHING
-                        RETURNING id;
-                        """, (clean_name, category))
-                        
-                        skill_res = cur.fetchone()
-                        if skill_res:
-                            skill_id = skill_res['id']
-                        else:
-                            cur.execute("SELECT id FROM skills WHERE name = %s", (clean_name,))
-                            skill_id = cur.fetchone()['id']
-                        
-                        # Link Job <-> Skill
-                        cur.execute("""
-                        INSERT INTO job_skills (job_id, skill_id)
-                        VALUES (%s, %s)
-                        ON CONFLICT DO NOTHING;
-                        """, (job_id, skill_id))
+                        for clean_name in normalized_skills:
+                            # Insert Skill if new
+                            cur.execute("""
+                            INSERT INTO skills (name, category) 
+                            VALUES (%s, %s)
+                            ON CONFLICT (name) DO NOTHING
+                            RETURNING id;
+                            """, (clean_name, category))
+                            
+                            skill_res = cur.fetchone()
+                            if skill_res:
+                                skill_id = skill_res['id']
+                            else:
+                                cur.execute("SELECT id FROM skills WHERE name = %s", (clean_name,))
+                                skill_id = cur.fetchone()['id']
+                            
+                            # Link Job <-> Skill
+                            cur.execute("""
+                            INSERT INTO job_skills (job_id, skill_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING;
+                            """, (job_id, skill_id))
                 
                 conn.commit()
                 print(f"💾 Saved job '{job_data.get('job_title')}' to Postgres.")
@@ -125,6 +212,47 @@ def save_job_data(job_data):
             except Exception as e:
                 conn.rollback()
                 print(f"Database Error: {e}")
+
+def save_failed_url(url: str, error: str):
+    """
+    Save a URL that failed to scrape so we can skip it in future runs.
+    If the URL already exists, increment the attempt counter.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO failed_urls (url, error) 
+                VALUES (%s, %s)
+                ON CONFLICT (url) DO UPDATE 
+                    SET attempts = failed_urls.attempts + 1,
+                        error = EXCLUDED.error,
+                        last_attempt = CURRENT_TIMESTAMP
+            """, (url, error))
+            conn.commit()
+
+
+def get_failed_urls() -> set:
+    """
+    Get all URLs that have failed to scrape.
+    
+    Returns:
+        Set of URLs that failed
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT url FROM failed_urls")
+            rows = cur.fetchall()
+            return {row['url'] for row in rows}
+
+
+def clear_failed_urls():
+    """Clear all failed URLs (useful for retrying everything)."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM failed_urls")
+            conn.commit()
+            print("Cleared all failed URLs")
+
 
 if __name__ == "__main__":
     init_db()
