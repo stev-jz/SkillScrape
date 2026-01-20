@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:18
+    container_name: skill_cluster_db
+    restart: always
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: job_market
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql
+
+volumes:
+  pg_data:
