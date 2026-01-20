@@ -5,7 +5,7 @@ Tracks which jobs have already been processed to avoid duplicates.
 Uses the database to store processed job URLs.
 """
 from typing import List, Set
-from db import get_db_connection
+from db import get_db_connection, get_failed_urls
 from github_scraper import JobPosting
 
 
@@ -23,30 +23,41 @@ def get_processed_urls() -> Set[str]:
             return {row['url'] for row in rows}
 
 
-def filter_new_jobs(jobs: List[JobPosting]) -> List[JobPosting]:
+def filter_new_jobs(jobs: List[JobPosting], skip_failed: bool = True) -> List[JobPosting]:
     """
-    Filter out jobs that have already been processed.
+    Filter out jobs that have already been processed or have failed.
     
     Args:
         jobs: List of job postings from GitHub
+        skip_failed: If True, also skip URLs that previously failed to scrape
         
     Returns:
         List of jobs that haven't been processed yet
     """
     processed_urls = get_processed_urls()
-    print(f"Found {len(processed_urls)} already processed jobs in database")
+    print(f"📊 Found {len(processed_urls)} already processed jobs in database")
     
-    # Filter out jobs whose URLs are already in the database
+    failed_urls = set()
+    if skip_failed:
+        failed_urls = get_failed_urls()
+        if failed_urls:
+            print(f"⚠️  Found {len(failed_urls)} previously failed URLs (skipping)")
+    
+    # Combine URLs to skip
+    skip_urls = processed_urls | failed_urls
+    
+    # Filter out jobs whose URLs are already in the database or have failed
     new_jobs = []
     for job in jobs:
         # Check both with and without query params
         url_clean = job.apply_url.split('?')[0]
         
-        if job.apply_url not in processed_urls and url_clean not in processed_urls:
+        if job.apply_url not in skip_urls and url_clean not in skip_urls:
             new_jobs.append(job)
     
-    skipped = len(jobs) - len(new_jobs)
-    print(f"Filtered: {len(new_jobs)} new jobs to process ({skipped} already in database)")
+    skipped_processed = len([j for j in jobs if j.apply_url in processed_urls or j.apply_url.split('?')[0] in processed_urls])
+    skipped_failed = len(jobs) - len(new_jobs) - skipped_processed
+    print(f"✓ Filtered: {len(new_jobs)} new jobs to process ({skipped_processed} processed, {skipped_failed} failed)")
     
     return new_jobs
 
