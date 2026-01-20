@@ -11,8 +11,8 @@ import time
 
 from github_scraper import JobPosting, get_job_urls
 from scraper import scrape_page
-from parser import parse_job_text
-from db import save_job_data, init_db
+from parser import parse_job_text, parse_job_texts_batch
+from db import save_job_data, init_db, save_failed_url
 from job_tracker import filter_new_jobs, print_stats
 
 
@@ -48,6 +48,7 @@ class BatchProcessor:
         """
         Process a single job posting: scrape -> parse -> save.
         Uses semaphore to limit concurrency.
+        Failed URLs are saved to avoid retrying them.
         """
         async with self.semaphore:
             try:
@@ -55,20 +56,24 @@ class BatchProcessor:
                 html_content = await scrape_page(job.apply_url)
                 
                 if not html_content or len(html_content) < 500:
+                    error_msg = f"Scraping failed or content too short ({len(html_content) if html_content else 0} chars)"
+                    save_failed_url(job.apply_url, error_msg)
                     return ProcessResult(
                         job=job,
                         success=False,
-                        error=f"Scraping failed or content too short ({len(html_content) if html_content else 0} chars)"
+                        error=error_msg
                     )
                 
                 # 2. Parse with Gemini
                 parsed = parse_job_text(html_content)
                 
                 if not parsed:
+                    error_msg = "Parsing failed"
+                    save_failed_url(job.apply_url, error_msg)
                     return ProcessResult(
                         job=job,
                         success=False,
-                        error="Parsing failed"
+                        error=error_msg
                     )
                 
                 # 3. Enrich with data from GitHub (in case Gemini missed it)
@@ -91,45 +96,106 @@ class BatchProcessor:
                 )
                 
             except Exception as e:
+                error_msg = str(e)
+                save_failed_url(job.apply_url, error_msg)
                 return ProcessResult(
                     job=job,
                     success=False,
-                    error=str(e)
+                    error=error_msg
                 )
     
+    async def scrape_single_job(self, job: JobPosting) -> tuple[JobPosting, Optional[str], Optional[str]]:
+        """
+        Scrape a single job page (no parsing).
+        Returns: (job, html_content, error)
+        """
+        async with self.semaphore:
+            try:
+                html_content = await scrape_page(job.apply_url)
+                
+                if not html_content or len(html_content) < 500:
+                    error_msg = f"Scraping failed or content too short ({len(html_content) if html_content else 0} chars)"
+                    return (job, None, error_msg)
+                
+                return (job, html_content, None)
+                
+            except Exception as e:
+                return (job, None, str(e))
+
     async def process_batch(self, jobs: List[JobPosting]) -> List[ProcessResult]:
         """
-        Process a batch of jobs concurrently.
+        Process a batch of jobs efficiently:
+        1. Scrape all jobs concurrently
+        2. Parse ALL scraped content in ONE API call (saves requests!)
+        3. Save results to database
         
-        Args:
-            jobs: List of job postings to process
-            
-        Returns:
-            List of ProcessResult objects
+        This uses 1 API request per batch instead of 1 per job.
         """
-        print(f"\nProcessing batch of {len(jobs)} jobs (max {self.max_concurrent} concurrent)...")
+        print(f"\n🔄 Processing batch of {len(jobs)} jobs...")
+        print(f"   (Scraping: max {self.max_concurrent} concurrent, Parsing: 1 API call for all)")
         start_time = time.time()
         
-        # Create tasks for all jobs in the batch
-        tasks = [self.process_single_job(job) for job in jobs]
+        # Step 1: Scrape all jobs concurrently
+        scrape_tasks = [self.scrape_single_job(job) for job in jobs]
+        scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
         
-        # Run all tasks concurrently (semaphore limits actual concurrency)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Separate successful scrapes from failures
+        to_parse = []  # (job, content) tuples
+        results = []   # Final results
         
-        # Handle any exceptions that slipped through
-        processed_results = []
-        for i, result in enumerate(results):
+        for i, result in enumerate(scrape_results):
             if isinstance(result, Exception):
-                processed_results.append(ProcessResult(
-                    job=jobs[i],
-                    success=False,
-                    error=str(result)
-                ))
+                save_failed_url(jobs[i].apply_url, str(result))
+                results.append(ProcessResult(job=jobs[i], success=False, error=str(result)))
             else:
-                processed_results.append(result)
+                job, content, error = result
+                if error:
+                    save_failed_url(job.apply_url, error)
+                    results.append(ProcessResult(job=job, success=False, error=error))
+                else:
+                    to_parse.append((job, content))
+        
+        scrape_success = len(to_parse)
+        print(f"   ✓ Scraped: {scrape_success}/{len(jobs)} succeeded")
+        
+        # Step 2: Parse all scraped content in ONE API call
+        if to_parse:
+            # Build input for batch parser: (job_id, text)
+            parse_input = [(str(i), content) for i, (job, content) in enumerate(to_parse)]
+            
+            print(f"   🤖 Parsing {len(parse_input)} jobs in single API call...")
+            parsed_results = parse_job_texts_batch(parse_input)
+            
+            # Create a lookup by job_id
+            parsed_lookup = {str(p.get('job_id', i)): p for i, p in enumerate(parsed_results)}
+            
+            # Step 3: Save results
+            for i, (job, content) in enumerate(to_parse):
+                parsed = parsed_lookup.get(str(i))
+                
+                if not parsed:
+                    save_failed_url(job.apply_url, "Parsing failed - no result returned")
+                    results.append(ProcessResult(job=job, success=False, error="Parsing failed"))
+                    continue
+                
+                # Enrich with GitHub data
+                if not parsed.get('job_title') or parsed.get('job_title') == 'null':
+                    parsed['job_title'] = job.role
+                if not parsed.get('company') or parsed.get('company') == 'null':
+                    parsed['company'] = job.company
+                
+                parsed['url'] = job.apply_url
+                parsed['location'] = job.location
+                
+                # Remove job_id field before saving (it was just for matching)
+                parsed.pop('job_id', None)
+                
+                # Save to database
+                save_job_data(parsed)
+                results.append(ProcessResult(job=job, success=True, parsed_data=parsed))
         
         # Update stats
-        for result in processed_results:
+        for result in results:
             self.processed += 1
             if result.success:
                 self.succeeded += 1
@@ -137,9 +203,10 @@ class BatchProcessor:
                 self.failed += 1
         
         elapsed = time.time() - start_time
-        print(f"Batch complete in {elapsed:.1f}s - {sum(1 for r in processed_results if r.success)}/{len(jobs)} succeeded")
+        success_count = sum(1 for r in results if r.success)
+        print(f"   ✓ Batch complete in {elapsed:.1f}s - {success_count}/{len(jobs)} succeeded")
         
-        return processed_results
+        return results
     
     async def process_all(self, jobs: List[JobPosting], batch_size: int = 10) -> List[ProcessResult]:
         """
@@ -189,7 +256,8 @@ async def run_batch_pipeline(
     limit: int = None,
     batch_size: int = 10,
     max_concurrent: int = 5,
-    skip_existing: bool = True
+    skip_existing: bool = True,
+    skip_failed: bool = True
 ):
     """
     Main entry point for batch processing jobs from GitHub.
@@ -199,26 +267,34 @@ async def run_batch_pipeline(
         batch_size: Jobs per batch
         max_concurrent: Max concurrent scraping tasks
         skip_existing: If True, skip jobs already in the database
+        skip_failed: If True, skip URLs that previously failed to scrape
     """
     # Initialize database
     init_db()
     
-    # Fetch job URLs from GitHub
-    print("Fetching jobs from GitHub...")
-    jobs = get_job_urls(limit=limit)
+    # Fetch ALL job URLs from GitHub (don't limit here)
+    print("📥 Fetching jobs from GitHub...")
+    jobs = get_job_urls(limit=None)
     
     if not jobs:
         print("No jobs found!")
         return []
     
-    # Filter out already-processed jobs
+    print(f"✓ Found {len(jobs)} total job postings")
+    
+    # Filter out already-processed and failed jobs
     if skip_existing:
-        jobs = filter_new_jobs(jobs)
+        jobs = filter_new_jobs(jobs, skip_failed=skip_failed)
         
         if not jobs:
             print("All jobs have already been processed!")
             print_stats()
             return []
+    
+    # Apply limit AFTER filtering (so we get `limit` unique new jobs)
+    if limit and len(jobs) > limit:
+        print(f"📊 Limiting to {limit} new jobs (out of {len(jobs)} available)")
+        jobs = jobs[:limit]
     
     # Process in batches
     processor = BatchProcessor(
