@@ -342,7 +342,7 @@ def show_pipeline_info():
     st.markdown("""
     The scraping pipeline:
     1. Fetches job URLs from GitHub
-    2. Filters out already-processed jobs
+    2. Filters out already processed jobs
     3. Scrapes new job postings
     4. Extracts skills using AI
     5. Saves to database
@@ -357,14 +357,8 @@ def show_pipeline_info():
         st.markdown("**Run once** (scrape new jobs):")
         st.code("python src/scheduler.py --max-jobs 10", language="bash")
         
-        st.markdown("**Run as daemon** (auto-scrape every 24 hours):")
-        st.code("python src/scheduler.py --daemon --interval 24", language="bash")
-        
         st.markdown("**View database stats**:")
         st.code("python src/scheduler.py --stats", language="bash")
-        
-        st.markdown("**Custom batch settings**:")
-        st.code("python src/scheduler.py --max-jobs 20 --batch-size 5 --max-concurrent 3", language="bash")
 
 
 if __name__ == "__main__":
