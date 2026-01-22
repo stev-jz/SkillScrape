@@ -69,9 +69,6 @@ def parse_job_text(raw_text):
         return None
 
 
-# Maximum safe batch size (accounts for 1M token limit with ~8K chars per job)
-MAX_BATCH_SIZE = 30
-
 def parse_job_texts_batch(job_texts: list[tuple[str, str]]) -> list[dict]:
     """
     Parse multiple job descriptions in a SINGLE API call.
@@ -85,11 +82,6 @@ def parse_job_texts_batch(job_texts: list[tuple[str, str]]) -> list[dict]:
     """
     if not job_texts:
         return []
-    
-    # Safety check: limit batch size to avoid token limits
-    if len(job_texts) > MAX_BATCH_SIZE:
-        print(f"⚠️  Warning: Batch size {len(job_texts)} exceeds safe limit of {MAX_BATCH_SIZE}. Truncating.")
-        job_texts = job_texts[:MAX_BATCH_SIZE]
     
     # Build the batch prompt
     jobs_section = ""
@@ -135,7 +127,7 @@ HERE ARE {len(job_texts)} JOB DESCRIPTIONS TO PARSE:
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash', 
+            model='gemini-2.5-flash-lite', 
             contents=prompt
         )
         
