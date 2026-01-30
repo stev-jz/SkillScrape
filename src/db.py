@@ -88,9 +88,6 @@ JOB_CATEGORIES = [
                       'data fabric', 'data management', 'failure analysis data', 'pricing data',
                       'risk analysis']),
     ('Research', ['research', 'scientist', 'phd', 'r&d', 'bell labs']),
-    ('DevOps / Infrastructure', ['devops', 'cloud', 'sre', 'infrastructure', 'platform engineer', 
-                                  'reliability', 'kubernetes', 'aws', 'azure', 'gcp',
-                                  'network systems', 'network automation']),
     ('Software Engineering', ['software', 'developer', 'swe', 'full stack', 'fullstack', 
                               'frontend', 'backend', 'web', 'mobile', 'ios', 'android', 
                               'engineer', 'engineering', 'programmer', 'coder', 'technology',
@@ -101,7 +98,9 @@ JOB_CATEGORIES = [
                               'digitalization', 'dimensional', 'innovation', 'predictive',
                               'language models', 'algorithms', '6g', 'digital twin',
                               'platform', 'adtech', 'd365', 'consulting', 'euv', 'agile',
-                              'product associate', 'commerce']),
+                              'product associate', 'commerce', 'devops', 'cloud', 'sre', 
+                              'infrastructure', 'platform engineer', 'reliability', 
+                              'kubernetes', 'aws', 'azure', 'gcp', 'network']),
 ]
 
 def categorize_job_title(title: str) -> str:
@@ -516,6 +515,46 @@ def delete_non_tech_jobs():
                 print("✅ No non-tech jobs found to delete.")
             
             return deleted_count
+
+
+def fix_skill_categories():
+    """
+    Fix miscategorized skills in the database.
+    Moves skills to their correct categories.
+    """
+    # Define corrections: skill_name -> correct_category
+    SKILL_CORRECTIONS = {
+        # These should be frameworks, not languages
+        'Node.js': 'frameworks',
+        'node.js': 'frameworks',
+        'NodeJS': 'frameworks',
+        'Express': 'frameworks',
+        'Express.js': 'frameworks',
+        '.NET': 'frameworks',
+        # These should be tools, not languages
+        'Linux': 'tools',
+        'Unix': 'tools',
+        'Windows': 'tools',
+        'Bash': 'tools',
+        'Shell': 'tools',
+        'PowerShell': 'tools',
+    }
+    
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            updated = 0
+            for skill_name, correct_category in SKILL_CORRECTIONS.items():
+                cur.execute(
+                    "UPDATE skills SET category = %s WHERE LOWER(name) = LOWER(%s) AND category != %s",
+                    (correct_category, skill_name, correct_category)
+                )
+                if cur.rowcount > 0:
+                    print(f"  ✓ {skill_name} → {correct_category}")
+                    updated += cur.rowcount
+            
+            conn.commit()
+            print(f"✅ Fixed {updated} skill categories")
+            return updated
 
 
 if __name__ == "__main__":
